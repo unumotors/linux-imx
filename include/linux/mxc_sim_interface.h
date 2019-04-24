@@ -83,6 +83,7 @@ typedef struct {
 #define SIM_ERROR_NACK_THRESHOLD	(1 << 6)
 #define SIM_ERROR_BGT			(1 << 7)
 #define SIM_ERROR_ATR_DELAY		(1 << 8)
+#define SIM_ERROR_OVERRUN		(1 << 9)
 
 /* Return values for SIM_IOCTL_GET_ERROR */
 #define SIM_E_ACCESS			(1)

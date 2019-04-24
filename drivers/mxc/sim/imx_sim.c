@@ -239,7 +239,7 @@
 #define ATR_THRESHOLD_MAX		(100)
 #define ATR_MAX_CWT			(10080)
 #define ATR_MAX_DURATION		(20160)
-#define FCLK_FREQ			(4000000)
+#define FCLK_FREQ			(3571200)
 
 #define ATR_TIMEOUT			(5)
 #define TX_TIMEOUT			(10)
@@ -349,7 +349,8 @@ static void sim_set_tx(struct sim_t *sim, u8 enable)
 
 	reg_data = __raw_readl(sim->ioaddr + ENABLE);
 	if (enable) {
-		reg_data |= SIM_ENABLE_XMTEN | SIM_ENABLE_RCVEN;
+		reg_data |= SIM_ENABLE_XMTEN;
+		reg_data &= ~SIM_ENABLE_RCVEN;
 		if (sim->quirks & SIM_QUIRK_TKT259347)
 			reg_data &= ~(SIM_ESTOP_EN | SIM_ESTOP_EXE);
 	} else
@@ -450,11 +451,12 @@ static void sim_set_cwt(struct sim_t *sim, u8 enable)
 {
 	u32 reg_val;
 	reg_val = __raw_readl(sim->ioaddr + CNTL);
-	if (enable && sim->timing_data.cwt)
+	reg_val &= ~SIM_CNTL_CWTEN;
+	__raw_writel(reg_val, sim->ioaddr + CNTL); // writing a 0 to the register resets the counter
+	if (enable && sim->timing_data.cwt) {
 		reg_val |= SIM_CNTL_CWTEN;
-	else
-		reg_val &= ~SIM_CNTL_CWTEN;
-	__raw_writel(reg_val, sim->ioaddr + CNTL);
+		__raw_writel(reg_val, sim->ioaddr + CNTL);
+	}
 }
 
 static void sim_set_bwt(struct sim_t *sim, u8 enable)
@@ -585,11 +587,16 @@ static void sim_rcv_read_fifo(struct sim_t *sim)
 		reg_data = __raw_readl(sim->ioaddr + PORT1_RCV_BUF);
 		sim->errval |= sim_check_rec_data(&reg_data);
 
+		if (sim->rcv_count >= SIM_RCV_BUFFER_SIZE) { // if sw fifo full -> still flush hw fifo
+			sim->errval |= SIM_ERROR_OVERRUN;
+			continue;
+		}
+
 		/* T1 mode and t0 mode no parity error, T1 mode SIM module will not produce NACK be
 		 * NACK is disabled. T0 mode to ensure there is no parity error for the current byte
 		 */
 		if (!(sim->nack_enable && (reg_data & SIM_REC_PARITY_ERROR))) {
-			sim->rcv_buffer[sim->rcv_head + sim->rcv_count] = (u8)reg_data;
+			sim->rcv_buffer[(sim->rcv_head + sim->rcv_count) % SIM_RCV_BUFFER_SIZE] = (u8)reg_data;
 			sim->rcv_count++;
 		}
 		if (sim->rcv_head + sim->rcv_count >= SIM_RCV_BUFFER_SIZE) {
@@ -652,7 +659,7 @@ static void sim_rx_irq_enable(struct sim_t *sim)
 	sim_set_cwt(sim, 1);
 	reg_data = __raw_readl(sim->ioaddr + INT_MASK);
 	reg_data |= (SIM_INT_MASK_TCIM | SIM_INT_MASK_TDTFM | SIM_INT_MASK_XTM);
-	reg_data &= ~(SIM_INT_MASK_RIM | SIM_INT_MASK_CWTM | SIM_INT_MASK_BWTM);
+	reg_data &= ~(SIM_INT_MASK_CWTM | SIM_INT_MASK_BWTM);
 
 	if (sim->protocol_type == SIM_PROTOCOL_T0 || sim->nack_enable != 0)
 		reg_data &= ~SIM_INT_MASK_RTM;
@@ -836,13 +843,10 @@ static irqreturn_t sim_irq_handler(int irq, void *dev_id)
 		}
 
 		if ((rx_status & SIM_RCV_STATUS_CWT) ||
-			(rx_status & SIM_RCV_STATUS_BWT) ||
-			(rx_status & SIM_RCV_STATUS_BGT)) {
+			(rx_status & SIM_RCV_STATUS_BWT)) {
 
 			/*Disable the BWT timer and CWT timer right now*/
-			sim_set_cwt(sim, 0);
-			sim_set_bwt(sim, 0);
-			sim_rx_irq_disable(sim);
+			// sim_rx_irq_disable(sim);
 
 			if (rx_status & SIM_RCV_STATUS_BWT) {
 				sim->errval |= SIM_ERROR_BWT;
@@ -852,12 +856,7 @@ static irqreturn_t sim_irq_handler(int irq, void *dev_id)
 			if (rx_status & SIM_RCV_STATUS_BGT)
 				sim->errval |= SIM_ERROR_BGT;
 
-			sim_rcv_read_fifo(sim);
-			/*Add the state judgement to ensure the maybe complete has been impletment in the above "if" case*/
-			if (sim->state == SIM_STATE_RECEIVING) {
-				sim->state = SIM_STATE_RECEIVE_DONE;
-				complete(&sim->xfer_done);
-			}
+			complete(&sim->xfer_done);
 		}
 	}
 
@@ -1077,11 +1076,11 @@ static int sim_check_baud_rate(sim_baud_t *baud_rate)
 	/*
 	 * The valid value is decribed in the 8.3.3.1 in EMV 4.3
 	 */
-	if (baud_rate->fi == 1 && (baud_rate->di == 1 ||
-					baud_rate->di == 2 || baud_rate->di == 3))
-		return 0;
+	//if (baud_rate->fi == 1 && (baud_rate->di == 1 ||
+	//				baud_rate->di == 2 || baud_rate->di == 3))
+	//	return 0;
 
-	return -EINVAL;
+	return 0;
 }
 
 static int sim_set_baud_rate(struct sim_t *sim)
@@ -1091,14 +1090,26 @@ static int sim_set_baud_rate(struct sim_t *sim)
 	reg_data &= ~(SIM_CNTL_BAUD_SEL_MASK);
 
 	switch (sim->baud_rate.di) {
-	case 1:
+	case 0:
 		reg_data |= SIM_CNTL_BAUD_SEL(0);
 		break;
-	case 2:
+	case 1:
 		reg_data |= SIM_CNTL_BAUD_SEL(1);
 		break;
-	case 3:
+	case 2:
 		reg_data |= SIM_CNTL_BAUD_SEL(2);
+		break;
+	case 3:
+		reg_data |= SIM_CNTL_BAUD_SEL(3);
+		break;
+	case 4:
+		reg_data |= SIM_CNTL_BAUD_SEL(4);
+		break;
+	case 5:
+		reg_data |= SIM_CNTL_BAUD_SEL(5);
+		break;
+	case 6:
+		reg_data |= SIM_CNTL_BAUD_SEL(6);
 		break;
 	default:
 		pr_err("Invalid baud Di, Using default 372 / 1\n");
@@ -1133,18 +1144,21 @@ static void sim_set_timer_counter(struct sim_t *sim)
 		sim->timing_data.bwt = sim->timing_data.wwt;
 	}
 
-
+	/* those +11 come from the fact that bgt, cwt, bwt and cgt refer to _inter_ character timings
+	 * the timer in the imx however, starts counting from start_bits thus the 11 ETUs for regular
+	 * transmissions have to be added
+	 */
 	if (sim->timing_data.bgt != 0) {
-		__raw_writel(sim->timing_data.bgt, sim->ioaddr + BGT);
+		__raw_writel(sim->timing_data.bgt + 11, sim->ioaddr + BGT);
 	}
 
 	if (sim->timing_data.cwt != 0)
-		__raw_writel(sim->timing_data.cwt, sim->ioaddr + CHAR_WAIT);
+		__raw_writel(sim->timing_data.cwt + 11, sim->ioaddr + CHAR_WAIT);
 
 	if (sim->timing_data.bwt != 0) {
 
-		__raw_writel(sim->timing_data.bwt & 0x0000FFFF, sim->ioaddr + BWT);
-		__raw_writel((sim->timing_data.bwt >> 16) & 0x0000FFFF,
+		__raw_writel((sim->timing_data.bwt + 11) & 0x0000FFFF, sim->ioaddr + BWT);
+		__raw_writel(((sim->timing_data.bwt + 11) >> 16) & 0x0000FFFF,
 				sim->ioaddr + BWT_H);
 	}
 
@@ -1152,7 +1166,7 @@ static void sim_set_timer_counter(struct sim_t *sim)
 		/* From EMV4.3 , CGT =0xFF in T0 mode means 12 ETU.
 		 * Set register to be 12 ETU for transmitting and receiving.
 		 */
-		__raw_writel(0 , sim->ioaddr + GUARD_CNTL);
+		__raw_writel(12 , sim->ioaddr + GUARD_CNTL);
 	else if (sim->timing_data.cgt == 0xFF && sim->protocol_type == SIM_PROTOCOL_T1)
 		/* From EMV4.3 , CGT =0xFF in T1 mode means 11 ETU.
 		 * Set register to be 12 ETU for transmitting and receiving.
@@ -1179,6 +1193,7 @@ static void sim_xmt_start(struct sim_t *sim)
 		reg_val |= SIM_XMT_THRESHOLD_TDT(TX_FIFO_THRESHOLD);
 		__raw_writel(reg_val, sim->ioaddr + XMT_THRESHOLD);
 	}
+	reinit_completion(&sim->xfer_done);
 	sim_tx_irq_enable(sim);
 
 	/*Enable  BWT and disalbe CWT timers when tx*/
@@ -1242,12 +1257,17 @@ static void sim_start_rcv(struct sim_t *sim)
 	 else
 		__raw_writel(SIM_RCV_THRESHOLD_RDT(RX_FIFO_THRESHOLD), sim->ioaddr + RCV_THRESHOLD);
 
+	/*Disalbe TX and Enable Rx*/
+	sim_set_tx(sim, 0);
+	sim_set_rx(sim, 1);
+
+	sim_set_cwt(sim, 1);
+	sim_set_bwt(sim, 1);
+
+	reinit_completion(&sim->xfer_done);
+
 	/*Clear status and enable interrupt*/
 	sim_rx_irq_enable(sim);
-
-	/*Disalbe TX and Enable Rx*/
-	sim_set_rx(sim, 1);
-	sim_set_tx(sim, 0);
 }
 
 static void sim_polling_delay(struct sim_t *sim, u32 delay)
@@ -1463,6 +1483,7 @@ static long sim_ioctl(struct file *file,
 		/*Start RX*/
 		sim->errval = 0;
 		sim->state = SIM_STATE_RECEIVING;
+		sim_set_timer_counter(sim);
 		sim_start_rcv(sim);
 
 		break;
@@ -1488,36 +1509,32 @@ static long sim_ioctl(struct file *file,
 		if (sim->expected_rcv_cnt != 0)
 			sim->is_fixed_len_rec = 1;
 
-		if (sim->is_fixed_len_rec && sim->rcv_count >= sim->expected_rcv_cnt)
+		spin_lock_irqsave(&sim->lock, flags);
+		if (sim->errval) {
+			spin_unlock_irqrestore(&sim->lock, flags);
 			goto copy_data;
+		}
+		spin_unlock_irqrestore(&sim->lock, flags);
 
 		if (sim->state != SIM_STATE_RECEIVING) {
-			sim_set_timer_counter(sim);
-			/*Enable CWT BWT*/
-			sim_set_cwt(sim, 1);
-			sim_set_bwt(sim, 1);
 			sim->state = SIM_STATE_RECEIVING;
+			sim_set_timer_counter(sim);
 			sim_start_rcv(sim);
 		}
 
-		spin_lock_irqsave(&sim->lock, flags);
-		if (sim->is_fixed_len_rec && sim->rcv_count < sim->expected_rcv_cnt)
-			sim_change_rcv_threshold(sim);
-		spin_unlock_irqrestore(&sim->lock, flags);
 		sim->timeout = RX_TIMEOUT * HZ;
 		timeout = wait_for_completion_interruptible_timeout(&sim->xfer_done,
 									sim->timeout);
 
 		if (timeout == 0) {
 			pr_err("Receiving timeout\n");
-			sim_set_cwt(sim, 0);
-			sim_set_bwt(sim, 0);
 			sim_rx_irq_disable(sim);
 			errval = -SIM_E_TIMEOUT;
 			break;
 		}
 
 copy_data:
+		sim_rcv_read_fifo(sim);
 		if (sim->is_fixed_len_rec)
 			copy_cnt = sim->rcv_count >= sim->expected_rcv_cnt ? sim->expected_rcv_cnt : sim->rcv_count;
 		else
@@ -1526,17 +1543,32 @@ copy_data:
 		ret = copy_to_user(&(((sim_rcv_t *)arg)->rcv_length), &copy_cnt,
 					sizeof(copy_cnt));
 		if (ret) {
-			pr_err("ATR ACCESS Error\n");
+			pr_err("cannot copy rcv_length\n");
 			errval = -SIM_E_ACCESS;
 			break;
 		}
 
 		__get_user(rcv_buffer, &((sim_rcv_t *)arg)->rcv_buffer);
-		ret = copy_to_user(rcv_buffer, &sim->rcv_buffer[sim->rcv_head], copy_cnt);
-		if (ret) {
-			pr_err("ATR ACCESS Error\n");
-			errval = -SIM_E_ACCESS;
-			break;
+		if (sim->rcv_head + copy_cnt <= SIM_RCV_BUFFER_SIZE) {
+			ret = copy_to_user(rcv_buffer, &sim->rcv_buffer[sim->rcv_head], copy_cnt);
+			if (ret) {
+				pr_err("cannot copy received data\n");
+				errval = -SIM_E_ACCESS;
+				break;
+			}
+		} else {
+			ret = copy_to_user(rcv_buffer, &sim->rcv_buffer[sim->rcv_head], SIM_RCV_BUFFER_SIZE - sim->rcv_head);
+			if (ret) {
+				pr_err("cannot copy received data\n");
+				errval = -SIM_E_ACCESS;
+				break;
+			}
+			ret = copy_to_user(rcv_buffer + SIM_RCV_BUFFER_SIZE - sim->rcv_head, &sim->rcv_buffer[0], copy_cnt - (SIM_RCV_BUFFER_SIZE - sim->rcv_head));
+			if (ret) {
+				pr_err("cannot copy received data\n");
+				errval = -SIM_E_ACCESS;
+				break;
+			}
 		}
 
 		ret = copy_to_user(&(((sim_rcv_t *)arg)->errval), &sim->errval,
@@ -1548,7 +1580,7 @@ copy_data:
 		}
 		/*Reset the receiving count and errval*/
 		spin_lock_irqsave(&sim->lock, flags);
-		sim->rcv_head += copy_cnt;
+		sim->rcv_head = (sim->rcv_head + copy_cnt) % SIM_RCV_BUFFER_SIZE;
 		sim->rcv_count -= copy_cnt;
 		sim->errval = 0;
 		spin_unlock_irqrestore(&sim->lock, flags);
