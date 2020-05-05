@@ -26,6 +26,7 @@
 #include <linux/device.h>
 #include <linux/genalloc.h>
 #include <linux/dma-mapping.h>
+#include <linux/dmapool.h>
 #include <linux/firmware.h>
 #include <linux/slab.h>
 #include <linux/platform_device.h>
@@ -194,139 +195,6 @@
 #define SDMA_WATERMARK_LEVEL_SW_DONE	BIT(23)
 #define SDMA_WATERMARK_LEVEL_SW_DONE_SEL_OFF 24
 
-/*
- * Mode/Count of data node descriptors - IPCv2
- */
-struct sdma_mode_count {
-#define SDMA_BD_MAX_CNT	0xffff
-	u32 count   : 16; /* size of the buffer pointed by this BD */
-	u32 status  :  8; /* E,R,I,C,W,D status bits stored here */
-	u32 command :  8; /* command mostly used for channel 0 */
-};
-
-/*
- * Buffer descriptor
- */
-struct sdma_buffer_descriptor {
-	struct sdma_mode_count  mode;
-	u32 buffer_addr;	/* address of the buffer described */
-	u32 ext_buffer_addr;	/* extended buffer address */
-} __attribute__ ((packed));
-
-/**
- * struct sdma_channel_control - Channel control Block
- *
- * @current_bd_ptr:	current buffer descriptor processed
- * @base_bd_ptr:	first element of buffer descriptor array
- * @unused:		padding. The SDMA engine expects an array of 128 byte
- *			control blocks
- */
-struct sdma_channel_control {
-	u32 current_bd_ptr;
-	u32 base_bd_ptr;
-	u32 unused[2];
-} __attribute__ ((packed));
-
-/**
- * struct sdma_state_registers - SDMA context for a channel
- *
- * @pc:		program counter
- * @unused1:	unused
- * @t:		test bit: status of arithmetic & test instruction
- * @rpc:	return program counter
- * @unused0:	unused
- * @sf:		source fault while loading data
- * @spc:	loop start program counter
- * @unused2:	unused
- * @df:		destination fault while storing data
- * @epc:	loop end program counter
- * @lm:		loop mode
- */
-struct sdma_state_registers {
-	u32 pc     :14;
-	u32 unused1: 1;
-	u32 t      : 1;
-	u32 rpc    :14;
-	u32 unused0: 1;
-	u32 sf     : 1;
-	u32 spc    :14;
-	u32 unused2: 1;
-	u32 df     : 1;
-	u32 epc    :14;
-	u32 lm     : 2;
-} __attribute__ ((packed));
-
-/**
- * struct sdma_context_data - sdma context specific to a channel
- *
- * @channel_state:	channel state bits
- * @gReg:		general registers
- * @mda:		burst dma destination address register
- * @msa:		burst dma source address register
- * @ms:			burst dma status register
- * @md:			burst dma data register
- * @pda:		peripheral dma destination address register
- * @psa:		peripheral dma source address register
- * @ps:			peripheral dma status register
- * @pd:			peripheral dma data register
- * @ca:			CRC polynomial register
- * @cs:			CRC accumulator register
- * @dda:		dedicated core destination address register
- * @dsa:		dedicated core source address register
- * @ds:			dedicated core status register
- * @dd:			dedicated core data register
- * @scratch0:		1st word of dedicated ram for context switch
- * @scratch1:		2nd word of dedicated ram for context switch
- * @scratch2:		3rd word of dedicated ram for context switch
- * @scratch3:		4th word of dedicated ram for context switch
- * @scratch4:		5th word of dedicated ram for context switch
- * @scratch5:		6th word of dedicated ram for context switch
- * @scratch6:		7th word of dedicated ram for context switch
- * @scratch7:		8th word of dedicated ram for context switch
- */
-struct sdma_context_data {
-	struct sdma_state_registers  channel_state;
-	u32  gReg[8];
-	u32  mda;
-	u32  msa;
-	u32  ms;
-	u32  md;
-	u32  pda;
-	u32  psa;
-	u32  ps;
-	u32  pd;
-	u32  ca;
-	u32  cs;
-	u32  dda;
-	u32  dsa;
-	u32  ds;
-	u32  dd;
-	u32  scratch0;
-	u32  scratch1;
-	u32  scratch2;
-	u32  scratch3;
-	u32  scratch4;
-	u32  scratch5;
-	u32  scratch6;
-	u32  scratch7;
-} __attribute__ ((packed));
-
-
-struct sdma_engine;
-
-/**
- * struct sdma_desc - descriptor structor for one transfer
- * @vd:			descriptor for virt dma
- * @num_bd:		number of descriptors currently handling
- * @bd_phys:		physical address of bd
- * @buf_tail:		ID of the buffer that was processed
- * @buf_ptail:		ID of the previous buffer that was processed
- * @period_len:		period length, used in cyclic.
- * @chn_real_count:	the real count updated from bd->mode.count
- * @chn_count:		the transfer count set
- * @sdmac:		sdma_channel pointer
- * @bd:			pointer of allocate bd
- */
 struct sdma_desc {
 	struct virt_dma_desc	vd;
 	unsigned int		num_bd;
@@ -399,9 +267,12 @@ struct sdma_channel {
 	unsigned int			fifo_num;
 	bool				sw_done;
 	u32				sw_done_sel;
+	struct dma_async_tx_descriptor 	cb;
+	struct tasklet_struct		cb_task;
 };
 
 #define IMX_DMA_SG_LOOP		BIT(0)
+#define IMX_DMA_CUSTOM_CALLBACK	BIT(1)
 
 #define MAX_DMA_CHANNELS 32
 #define MXC_SDMA_DEFAULT_PRIORITY 1
@@ -500,6 +371,8 @@ static int sdma_get_firmware(struct sdma_engine *sdma,
 		const char *fw_name);
 static int sdma_get_firmware_wait(struct sdma_engine *sdma,
 		const char *fw_name);
+
+static struct sdma_engine *sdma_singleton = NULL;
 
 static struct sdma_driver_data sdma_imx31 = {
 	.chnenbl0 = SDMA_CHNENBL0_IMX31,
@@ -713,13 +586,23 @@ MODULE_DEVICE_TABLE(of, sdma_dt_ids);
 #define SDMA_H_CONFIG_ACR	BIT(4)  /* indicates if AHB freq /core freq = 2 or 1 */
 #define SDMA_H_CONFIG_CSM	(3)       /* indicates which context switch mode is selected*/
 
+static void sdma_start_desc(struct sdma_channel *sdmac);
+
+/* returns an address in data space (32-bit words) */
+u32 sdma_channel_context_base(int ch)
+{
+	return 2048 + (sizeof(struct sdma_context_data) / 4) * ch;
+}
+EXPORT_SYMBOL(sdma_channel_context_base);
+
+
 static inline u32 chnenbl_ofs(struct sdma_engine *sdma, unsigned int event)
 {
 	u32 chnenbl0 = sdma->drvdata->chnenbl0;
 	return chnenbl0 + event * 4;
 }
 
-static int sdma_config_ownership(struct sdma_channel *sdmac,
+int sdma_config_ownership(struct sdma_channel *sdmac,
 		bool event_override, bool mcu_override, bool dsp_override)
 {
 	struct sdma_engine *sdma = sdmac->sdma;
@@ -754,6 +637,7 @@ static int sdma_config_ownership(struct sdma_channel *sdmac,
 
 	return 0;
 }
+EXPORT_SYMBOL(sdma_config_ownership);
 
 static void sdma_enable_channel(struct sdma_engine *sdma, int channel)
 {
@@ -785,7 +669,7 @@ static int sdma_run_channel0(struct sdma_engine *sdma)
 	return ret;
 }
 
-static int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
+int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
 		u32 address)
 {
 	struct sdma_buffer_descriptor *bd0 = sdma->bd0;
@@ -823,8 +707,9 @@ static int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
 
 	return ret;
 }
+EXPORT_SYMBOL(sdma_load_script);
 
-static void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
+void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
 {
 	struct sdma_engine *sdma = sdmac->sdma;
 	int channel = sdmac->channel;
@@ -850,8 +735,21 @@ static void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event)
 	}
 
 }
+EXPORT_SYMBOL(sdma_event_enable);
 
-static void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
+void sdma_event_enable_by_channel_mask(struct sdma_engine *sdma,
+	unsigned int channel_mask, unsigned int event)
+{
+	unsigned long val;
+	u32 chnenbl = chnenbl_ofs(sdma, event);
+
+	val = readl_relaxed(sdma->regs + chnenbl);
+	val |= channel_mask;
+	writel_relaxed(val, sdma->regs + chnenbl);
+}
+EXPORT_SYMBOL(sdma_event_enable_by_channel_mask);
+
+void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
 {
 	struct sdma_engine *sdma = sdmac->sdma;
 	int channel = sdmac->channel;
@@ -862,6 +760,19 @@ static void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event)
 	__clear_bit(channel, &val);
 	writel_relaxed(val, sdma->regs + chnenbl);
 }
+EXPORT_SYMBOL(sdma_event_disable);
+
+void sdma_event_disable_by_channel_mask(struct sdma_engine *sdma,
+	unsigned int channel_mask, unsigned int event)
+{
+	unsigned long val;
+	u32 chnenbl = chnenbl_ofs(sdma, event);
+
+	val = readl_relaxed(sdma->regs + chnenbl);
+	val &= ~channel_mask;
+	writel_relaxed(val, sdma->regs + chnenbl);
+}
+EXPORT_SYMBOL(sdma_event_disable_by_channel_mask);
 
 static struct sdma_desc *to_sdma_desc(struct dma_async_tx_descriptor *t)
 {
@@ -891,6 +802,119 @@ static void sdma_start_desc(struct sdma_channel *sdmac)
 	sdma->channel_control[channel].current_bd_ptr = desc->bd_phys;
 	sdma_enable_channel(sdma, sdmac->channel);
 }
+
+int sdma_write_datamem(struct sdma_engine *sdma, void *buf, int size,
+		u32 address)
+{
+	struct sdma_buffer_descriptor *bd0 = sdma->bd0;
+	void *buf_virt;
+	dma_addr_t buf_phys;
+	int ret;
+	unsigned long flags;
+	bool use_iram = true;
+
+	if (sdma->iram_pool) {
+		buf_virt = gen_pool_dma_alloc(sdma->iram_pool, size, &buf_phys);
+	} else {
+		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
+					      GFP_KERNEL);
+			use_iram = false;
+	}
+	if (!buf_virt) {
+		use_iram = false;
+		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
+				GFP_KERNEL);
+		if (!buf_virt)
+			return -ENOMEM;
+	}
+
+	spin_lock_irqsave(&sdma->channel_0_lock, flags);
+
+	bd0->mode.command = C0_SETDM;
+	bd0->mode.status = BD_DONE | BD_INTR | BD_WRAP | BD_EXTD;
+	bd0->mode.count = size / 4;
+	bd0->buffer_addr = buf_phys;
+	bd0->ext_buffer_addr = address;
+
+	memcpy(buf_virt, buf, size);
+
+	ret = sdma_run_channel0(sdma);
+
+	spin_unlock_irqrestore(&sdma->channel_0_lock, flags);
+
+	if (use_iram)
+		gen_pool_free(sdma->iram_pool, (unsigned long)buf_virt,
+				size);
+	else
+		dma_free_coherent(sdma->dev, size, buf_virt, buf_phys);
+
+	return ret;
+}
+EXPORT_SYMBOL(sdma_write_datamem);
+
+int sdma_fetch_datamem(struct sdma_engine *sdma, void *buf, int size,
+		u32 address)
+{
+	struct sdma_buffer_descriptor *bd0 = sdma->bd0;
+	void *buf_virt;
+	dma_addr_t buf_phys;
+	int ret;
+	unsigned long flags;
+	bool use_iram = true;
+
+	if (sdma->iram_pool) {
+		buf_virt = gen_pool_dma_alloc(sdma->iram_pool, size, &buf_phys);
+	} else {
+		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
+					      GFP_KERNEL);
+			use_iram = false;
+	}
+	if (!buf_virt) {
+		use_iram = false;
+		buf_virt = dma_alloc_coherent(sdma->dev, size, &buf_phys,
+				GFP_KERNEL);
+		if (!buf_virt)
+			return -ENOMEM;
+	}
+	spin_lock_irqsave(&sdma->channel_0_lock, flags);
+
+	bd0->mode.command = C0_GETDM;
+	bd0->mode.status = BD_DONE | BD_INTR | BD_WRAP | BD_EXTD;
+	bd0->mode.count = size / 4;
+	bd0->buffer_addr = buf_phys;
+	bd0->ext_buffer_addr = address;
+
+	ret = sdma_run_channel0(sdma);
+
+	memcpy(buf, buf_virt, size);
+
+	spin_unlock_irqrestore(&sdma->channel_0_lock, flags);
+
+	if (use_iram)
+		gen_pool_free(sdma->iram_pool, (unsigned long)buf_virt,
+				size);
+	else
+		dma_free_coherent(sdma->dev, size, buf_virt, buf_phys);
+
+	return ret;
+}
+EXPORT_SYMBOL(sdma_fetch_datamem);
+
+int sdma_fetch_partial_context(struct sdma_channel *sdmac, void *buf,
+	u32 byte_offset, u32 num_bytes)
+{
+	static const u32 csz = sizeof(struct sdma_context_data);
+	u32 addr;
+	if (num_bytes > csz || num_bytes == 0 ||
+	byte_offset >= csz || byte_offset+num_bytes > csz ||
+	num_bytes % sizeof(u32) || byte_offset % sizeof(u32)) {
+		dev_err(sdmac->sdma->dev, "%s: invalid offset/length", __func__);
+		return -EINVAL;
+	}
+	addr = sdma_channel_context_base(sdmac->channel) + byte_offset/sizeof(u32);
+	return sdma_fetch_datamem(sdmac->sdma, buf, num_bytes, addr);
+}
+EXPORT_SYMBOL(sdma_fetch_partial_context);
 
 static void sdma_update_channel_loop(struct sdma_channel *sdmac)
 {
@@ -967,6 +991,14 @@ static void mxc_sdma_handle_channel_normal(struct sdma_channel *data)
 		sdmac->status = DMA_COMPLETE;
 }
 
+static void sdma_custom_callback_tasklet(unsigned long data)
+{
+	struct sdma_channel *sdmac = (struct sdma_channel *) data;
+
+	if (sdmac->cb.callback)
+		sdmac->cb.callback(sdmac->cb.callback_param);
+}
+
 static irqreturn_t sdma_int_handler(int irq, void *dev_id)
 {
 	struct sdma_engine *sdma = dev_id;
@@ -987,7 +1019,9 @@ static irqreturn_t sdma_int_handler(int irq, void *dev_id)
 
 		spin_lock(&sdmac->vc.lock);
 		desc = sdmac->desc;
-		if (desc) {
+		if (sdmac->flags & IMX_DMA_CUSTOM_CALLBACK && sdmac->cb.callback) {
+			tasklet_schedule(&sdmac->cb_task);
+		} else if (desc) {
 			if (sdmac->flags & IMX_DMA_SG_LOOP) {
 				if (sdmac->peripheral_type != IMX_DMATYPE_HDMI)
 					sdma_update_channel_loop(sdmac);
@@ -1212,6 +1246,23 @@ static struct sdma_channel *to_sdma_chan(struct dma_chan *chan)
 	return container_of(chan, struct sdma_channel, vc.chan);
 }
 
+int sdma_load_partial_context(struct sdma_channel *sdmac,
+	struct sdma_context_data *context, u32 byte_offset, u32 num_bytes)
+{
+	static const u32 csz = sizeof(*context);
+	u32 addr;
+	if (num_bytes > csz || num_bytes == 0 ||
+	byte_offset >= csz || byte_offset+num_bytes > csz ||
+	num_bytes % sizeof(u32) || byte_offset % sizeof(u32)) {
+		dev_err(sdmac->sdma->dev, "%s: invalid offset/length", __func__);
+		return -EINVAL;
+	}
+	addr = sdma_channel_context_base(sdmac->channel) + byte_offset/sizeof(u32);
+	return sdma_write_datamem(sdmac->sdma, context, num_bytes, addr);
+}
+EXPORT_SYMBOL(sdma_load_partial_context);
+
+
 static int sdma_disable_channel(struct dma_chan *chan)
 {
 	struct sdma_channel *sdmac = to_sdma_chan(chan);
@@ -1390,7 +1441,7 @@ static int sdma_config_channel(struct dma_chan *chan)
 	return 0;
 }
 
-static int sdma_set_channel_priority(struct sdma_channel *sdmac,
+int sdma_set_channel_priority(struct sdma_channel *sdmac,
 		unsigned int priority)
 {
 	struct sdma_engine *sdma = sdmac->sdma;
@@ -1405,6 +1456,25 @@ static int sdma_set_channel_priority(struct sdma_channel *sdmac,
 
 	return 0;
 }
+EXPORT_SYMBOL(sdma_set_channel_priority);
+
+void sdma_set_channel_pending(struct sdma_channel *sdmac)
+{
+	struct sdma_engine *sdma = sdmac->sdma;
+	int channel = sdmac->channel;
+	unsigned long val = 0;
+
+	__set_bit(channel, &val);
+	writel_relaxed(val, sdma->regs + SDMA_H_EVTPEND);
+}
+EXPORT_SYMBOL(sdma_set_channel_pending);
+
+void sdma_set_channel_pending_by_mask(struct sdma_engine *sdma,
+	unsigned int channel_mask)
+{
+	writel_relaxed(channel_mask, sdma->regs + SDMA_H_EVTPEND);
+}
+EXPORT_SYMBOL(sdma_set_channel_pending_by_mask);
 
 static int sdma_request_channel0(struct sdma_engine *sdma)
 {
@@ -1464,6 +1534,23 @@ static void sdma_free_bd(struct sdma_desc *desc)
 		dma_free_coherent(desc->sdmac->sdma->dev, bd_size, desc->bd,
 				  desc->bd_phys);
 }
+
+void sdma_set_channel_interrupt_callback(struct sdma_channel *sdmac,
+		dma_async_tx_callback int_cb, void *cb_param)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&sdmac->vc.lock, flags);
+	if (int_cb)
+		sdmac->flags |= IMX_DMA_CUSTOM_CALLBACK;
+	else
+		sdmac->flags &= ~IMX_DMA_CUSTOM_CALLBACK;
+	sdmac->cb.callback = int_cb;
+	sdmac->cb.callback_param = cb_param;
+	tasklet_init(&sdmac->cb_task, sdma_custom_callback_tasklet,
+					 (unsigned long) sdmac);
+	spin_unlock_irqrestore(&sdmac->vc.lock, flags);
+}
+EXPORT_SYMBOL(sdma_set_channel_interrupt_callback);
 
 static void sdma_desc_free(struct virt_dma_desc *vd)
 {
@@ -2467,6 +2554,7 @@ static int sdma_probe(struct platform_device *pdev)
 	if (!sdma->drvdata->pm_runtime)
 		pm_runtime_get_sync(&pdev->dev);
 
+	sdma_singleton = sdma;
 	return 0;
 
 err_register:
@@ -2617,6 +2705,93 @@ static int sdma_resume(struct device *dev)
 	return ret;
 }
 #endif
+
+struct sdma_channel *sdma_get_channel(struct sdma_engine *sdma, int channel)
+{
+	if (channel < 0 || channel >= MAX_DMA_CHANNELS) {
+		return NULL;
+	}
+	return &sdma->channel[channel];
+}
+EXPORT_SYMBOL(sdma_get_channel);
+
+/* (mjs) convenience function for initializing a channel as
+ * host-triggered or event-triggered
+ * external=false: channel started by host, HO[i]=0, EO[i]=1
+ * external=true: channel started by event, HO[i]=1, EO[i]=0 */
+void sdma_setup_channel(struct sdma_channel *sdmac, bool external)
+{
+	sdma_disable_channel(&sdmac->vc.chan);
+	sdma_config_ownership(sdmac,
+		external,   /* event override */
+		!external,  /* host override */
+		false);     /* always false */
+}
+EXPORT_SYMBOL(sdma_setup_channel);
+
+struct sdma_engine *sdma_engine_get(void)
+{
+	return sdma_singleton;
+}
+EXPORT_SYMBOL(sdma_engine_get);
+
+ssize_t sdma_print_context(struct sdma_engine *sdma, int channel, char *buf)
+{
+	static const char *regnames[] = {
+		" r0", " r1", " r2", " r3", " r4", " r5", " r6", " r7",
+		"mda", "msa", " ms", " md", "pda", "psa", " ps", " pd",
+		" ca", " cs", "dda", "dsa", " ds", " dd", "sc0", "sc1",
+		"sc2", "sc3", "sc4", "sc5", "sc6", "sc7"
+	};
+
+	struct sdma_context_data *context;
+	u32 context_addr = sdma_channel_context_base(channel);
+	u32 context_size = sizeof(*context);
+	u32 *regptr;
+	int ret;
+	int i;
+	ssize_t outlen = 0;
+
+	context = kzalloc(context_size, GFP_ATOMIC);
+	if (!context) {
+		return -ENOMEM;
+	}
+
+	ret = sdma_fetch_datamem(sdma, context, context_size, context_addr);
+	if (ret) {
+		return ret;
+	}
+
+	outlen += scnprintf(buf+outlen, PAGE_SIZE-outlen,
+		"pc=%04x rpc=%04x spc=%04x epc=%04x\n",
+		context->channel_state.pc,
+		context->channel_state.rpc,
+		context->channel_state.spc,
+		context->channel_state.epc
+	);
+
+	outlen += scnprintf(buf+outlen, PAGE_SIZE-outlen,
+		"Flags: t=%d sf=%d df=%d lm=%d\n",
+		(context->channel_state.t != 0),
+		(context->channel_state.sf != 0),
+		(context->channel_state.df != 0),
+		(context->channel_state.lm != 0)
+	);
+
+	regptr = &context->gReg[0];
+	for (i = 0; i < ARRAY_SIZE(regnames); i++) {
+		outlen += scnprintf(buf+outlen, PAGE_SIZE-outlen,
+			"%s=%08x%c",
+			regnames[i],
+			regptr[i],
+			((i % 6) == 5) ? '\n' : ' ');
+	}
+	outlen += scnprintf(buf+outlen, PAGE_SIZE-outlen, "\n");
+
+	kfree(context);
+	return outlen;
+}
+EXPORT_SYMBOL(sdma_print_context);
 
 static const struct dev_pm_ops sdma_pm_ops = {
 	SET_LATE_SYSTEM_SLEEP_PM_OPS(sdma_suspend, sdma_resume)

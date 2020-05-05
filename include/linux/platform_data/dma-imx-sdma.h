@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __MACH_MXC_SDMA_H__
 #define __MACH_MXC_SDMA_H__
+
+#include <linux/dmaengine.h>
 
 /**
  * struct sdma_script_start_addrs - SDMA script start pointers
@@ -71,5 +72,321 @@ struct sdma_platform_data {
 	char *fw_name;
 	struct sdma_script_start_addrs *script_addrs;
 };
+
+/*
+ * Mode/Count of data node descriptors - IPCv2
+ */
+struct sdma_mode_count {
+	u32 count   : 16; /* size of the buffer pointed by this BD */
+	u32 status  :  8; /* E,R,I,C,W,D status bits stored here */
+	u32 command :  8; /* command mostlky used for channel 0 */
+};
+
+/*
+ * Buffer descriptor
+ */
+struct sdma_buffer_descriptor {
+	struct sdma_mode_count  mode;
+	u32 buffer_addr;	/* address of the buffer described */
+	u32 ext_buffer_addr;	/* extended buffer address */
+} __attribute__ ((packed));
+
+/**
+ * struct sdma_channel_control - Channel control Block
+ *
+ * @current_bd_ptr	current buffer descriptor processed
+ * @base_bd_ptr		first element of buffer descriptor array
+ * @unused		padding. The SDMA engine expects an array of 128 byte
+ *			control blocks
+ */
+struct sdma_channel_control {
+	u32 current_bd_ptr;
+	u32 base_bd_ptr;
+	u32 unused[2];
+} __attribute__ ((packed));
+
+/**
+ * struct sdma_state_registers - SDMA context for a channel
+ *
+ * @pc:		program counter
+ * @t:		test bit: status of arithmetic & test instruction
+ * @rpc:	return program counter
+ * @sf:		source fault while loading data
+ * @spc:	loop start program counter
+ * @df:		destination fault while storing data
+ * @epc:	loop end program counter
+ * @lm:		loop mode
+ */
+struct sdma_state_registers {
+	u32 pc     :14;
+	u32 unused1: 1;
+	u32 t      : 1;
+	u32 rpc    :14;
+	u32 unused0: 1;
+	u32 sf     : 1;
+	u32 spc    :14;
+	u32 unused2: 1;
+	u32 df     : 1;
+	u32 epc    :14;
+	u32 lm     : 2;
+} __attribute__ ((packed));
+
+/**
+ * struct sdma_context_data - sdma context specific to a channel
+ *
+ * @channel_state:	channel state bits
+ * @gReg:		general registers
+ * @mda:		burst dma destination address register
+ * @msa:		burst dma source address register
+ * @ms:			burst dma status register
+ * @md:			burst dma data register
+ * @pda:		peripheral dma destination address register
+ * @psa:		peripheral dma source address register
+ * @ps:			peripheral dma status register
+ * @pd:			peripheral dma data register
+ * @ca:			CRC polynomial register
+ * @cs:			CRC accumulator register
+ * @dda:		dedicated core destination address register
+ * @dsa:		dedicated core source address register
+ * @ds:			dedicated core status register
+ * @dd:			dedicated core data register
+ */
+struct sdma_context_data {
+	struct sdma_state_registers  channel_state;
+	u32  gReg[8];
+	u32  mda;
+	u32  msa;
+	u32  ms;
+	u32  md;
+	u32  pda;
+	u32  psa;
+	u32  ps;
+	u32  pd;
+	u32  ca;
+	u32  cs;
+	u32  dda;
+	u32  dsa;
+	u32  ds;
+	u32  dd;
+	u32  scratch0;
+	u32  scratch1;
+	u32  scratch2;
+	u32  scratch3;
+	u32  scratch4;
+	u32  scratch5;
+	u32  scratch6;
+	u32  scratch7;
+} __attribute__ ((packed));
+
+#define NUM_BD (int)(PAGE_SIZE / sizeof(struct sdma_buffer_descriptor))
+#define SDMA_BD_MAX_CNT	0xfffc /* align with 4 bytes */
+
+struct sdma_engine;
+
+struct sdma_channel;
+
+/**
+ * sdma_engine_get() - returns a pointer to the global SDMA engine
+ *
+ * Return: pointer to the sdma_engine object
+ */
+struct sdma_engine *sdma_engine_get(void);
+
+/**
+ * sdma_get_channel() - returns a pointer to the numbered SDMA channel
+ * @sdma:	pointer to the sdma_engine object
+ * @channel:	channel number from 0-31
+ *
+ * Return: pointer to channel object, or NULL
+ */
+struct sdma_channel *sdma_get_channel(struct sdma_engine *sdma, int channel);
+
+/**
+ * sdma_set_channel_interrupt_callback() - sets a custom interrupt handler
+ * @sdmac:	pointer to sdma_channel object
+ * @int_cb:	callback function to register
+ * @cb_param:	user-defined object passed when the callback is invoked
+ *
+ * Sets a function to be called when a custom SDMA script triggers an interrupt
+ * (e.g. with a "done 3" instruction).
+ * The function is executed in tasklet (atomic) context.
+ */
+void sdma_set_channel_interrupt_callback(struct sdma_channel *sdmac,
+		dma_async_tx_callback int_cb, void *cb_param);
+
+/**
+ * sdma_set_channel_priority() - sets the channel's execution priority
+ * @sdmac:	pointer to sdma_channel object
+ * @priority:	priority, from 0 (disabled) to 7 (highest)
+ *
+ * Setting a nonzero priority may cause the channel's script to begin executing,
+ * depending on how it is configured.
+ * Priority 7 is used by channel 0 for loading scripts/context. Typically,
+ * channel 0 should be the only channel with priority 7.
+ *
+ * Return: 0 on success, nonzero otherwise
+ */
+int sdma_set_channel_priority(struct sdma_channel *sdmac,
+		unsigned int priority);
+
+/**
+ * sdma_set_channel_pending() - sets the channel as pending
+ * @sdmac:	pointer to sdma_channel object
+ */
+void sdma_set_channel_pending(struct sdma_channel *sdmac);
+
+/**
+ * sdma_set_channel_pending_by_channel_mask() - sets a group of channels as
+ * pending
+ * @sdma:	pointer to the sdma_engine object
+ * @channel_mask: bitmask of channels to set pending
+ */
+void sdma_set_channel_pending_by_mask(struct sdma_engine *sdma,
+	unsigned int channel_mask);
+
+/**
+ * sdma_setup_channel() - convenience function for setting channel ownership
+ * @sdmac:	pointer to sdma_channel object
+ * @external:	if true, script is triggered by an external event,
+ *		if false, script is triggered by the CPU
+ */
+void sdma_setup_channel(struct sdma_channel *sdmac, bool external);
+
+/**
+ * sdma_event_enable() - allows a channel to be triggered by the numbered event
+ * @sdmac:	pointer to sdma_channel object
+ * @event:	event number (see reference manual)
+ */
+void sdma_event_enable(struct sdma_channel *sdmac, unsigned int event);
+
+/**
+ * sdma_event_enable_by_channel_mask() - allows a group of channels to be
+ * triggered by the numbered event
+ * @sdma:	pointer to the sdma_engine object
+ * @channel_mask: bitmask of channels to enable
+ * @event:	event number (see reference manual)
+ */
+void sdma_event_enable_by_channel_mask(struct sdma_engine *sdma,
+	unsigned int channel_mask, unsigned int event);
+
+/**
+ * sdma_event_disable() - prevents a channel from being triggered by an event
+ * @sdmac:	pointer to sdma_channel object
+ * @event:	event number (see reference manual)
+ */
+void sdma_event_disable(struct sdma_channel *sdmac, unsigned int event);
+
+/**
+ * sdma_event_disable_by_channel_mask() - prevents a group of channels from
+ * being triggered by an event
+ * @sdma:	pointer to the sdma_engine object
+ * @channel_mask: bitmask of channels to disable
+ * @event:	event number (see reference manual)
+ */
+void sdma_event_disable_by_channel_mask(struct sdma_engine *sdma,
+	unsigned int channel_mask, unsigned int event);
+
+/**
+ * sdma_is_event_enabled() - returns whether an event can trigger the channel
+ * @sdmac:	pointer to sdma_channel object
+ * @event:	event number (see reference manual)
+ * Return: 0 if disabled, nonzero if enabled
+ */
+int sdma_is_event_enabled(struct sdma_channel *sdmac, unsigned int event);
+
+/* address should be in program space (halfword addressing) */
+
+/**
+ * sdma_load_script() - copies script from ARM memory to SDMA memory
+ * @sdma:	pointer to sdma_engine object
+ * @buf:	start of script
+ * @size:	size of script in bytes
+ * @address:	destination address in SDMA program space
+ *		(using halfword addressing)
+ *
+ * Return: 0 on success, nonzero on error
+ */
+int sdma_load_script(struct sdma_engine *sdma, void *buf, int size,
+		u32 address);
+
+/**
+ * sdma_load_partial_context() - writes a subset of a channel's context
+ * @sdmac:		pointer to sdma_channel object
+ * @context:		pointer to data to write
+ * @byte_offset:	destination offset within the channel's context RAM
+ *			(must be a multiple of 4 and less than 128)
+ * @num_bytes:		number of bytes to copy into the channel's context RAM
+ *			(must be > 0 and <= 128)
+ *
+ * Can be used to update a subset of a channel's registers while leaving others
+ * undisturbed, e.g. to change a script's arguments while it is running without
+ * overwriting internal state.
+ * Since RAM loading is handled by channel 0, and channels cannot preempt each
+ * other, the load operation is mutually exclusive with the channel's execution.
+ * (i.e. a channel's registers will not change while its script is executing.)
+ *
+ * Example: to update a channel's entire context, use byte_offset=0 and
+ * num_bytes=128.
+ *
+ * Return: 0 on success, nonzero on error
+ */
+int sdma_load_partial_context(struct sdma_channel *sdmac,
+	struct sdma_context_data *context,
+	u32 byte_offset,
+	u32 num_bytes);
+
+/* size should be a value in bytes */
+/* address should be in data space (word addressing) */
+
+/**
+ * sdma_write_datamem() - writes data into the SDMA engine's address space
+ * @sdma:	pointer to sdma_engine object
+ * @buf:	data to write
+ * @size:	number of bytes to write
+ * @address:	destination offset, in 32-bit words, from the origin of SDMA
+ *		address space
+ *
+ * Return: 0 on success, nonzero on error
+ */
+int sdma_write_datamem(struct sdma_engine *sdma, void *buf, int size,
+	u32 address);
+
+/**
+ * sdma_fetch_partial_context() - reads a subset of a channel's context
+ * @sdmac:		pointer to sdma_channel object
+ * @buf:		buffer to receive data
+ * @byte_offset:	source offset within the channel's context RAM
+ *			(must be a multiple of 4 and less than 128)
+ * @num_bytes:		number of bytes to read from the channel's context RAM
+ *			(must be > 0 and <= 128)
+ *
+ * Since RAM loading is handled by channel 0, and channels cannot preempt each
+ * other, the fetch operation is mutually exclusive with the channel's
+ * execution. (i.e. the values will not be changing at the same time as they are
+ * being read.)
+ *
+ * Example: to fetch a channel's entire context, use byte_offset=0 and
+ * num_bytes=128.
+ *
+ * buf must be large enough to hold num_bytes of data.
+ *
+ * Return: 0 on success, nonzero on error
+ */
+int sdma_fetch_partial_context(struct sdma_channel *sdmac, void *buf,
+    u32 byte_offset,
+    u32 num_bytes);
+
+/**
+ * sdma_print_context() - dump string representation of channel context values
+ * @sdma:	pointer to sdma_engine object
+ * @channel:	channel number, 0-31
+ * @buf:	buffer to receive the string
+ *
+ * Prints a string representation of all channel registers and scratch memory
+ * words. buf should be at least 512 bytes long. Useful for debugging.
+ *
+ * Return: result string length in bytes, or < 0 on error
+ */
+ssize_t sdma_print_context(struct sdma_engine *sdma, int channel, char *buf);
 
 #endif /* __MACH_MXC_SDMA_H__ */
