@@ -302,7 +302,7 @@ static int lp5562_post_init_device(struct lp55xx_chip *chip)
 
 	/* Initialize all channels PWM to zero -> leds off */
 	lp55xx_write(chip, LP5562_REG_R_PWM, 0);
-	lp55xx_write(chip, LP5562_REG_G_PWM, 0);
+	lp55xx_write(chip, LP5562_REG_G_PWM, 255);
 	lp55xx_write(chip, LP5562_REG_B_PWM, 0);
 	lp55xx_write(chip, LP5562_REG_W_PWM, 0);
 
