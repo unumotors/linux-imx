@@ -179,7 +179,7 @@ static void wdm_in_callback(struct urb *urb)
 				"nonzero urb status received: -ESHUTDOWN\n");
 			goto skip_error;
 		case -EPIPE:
-			dev_err(&desc->intf->dev,
+			dev_dbg(&desc->intf->dev,
 				"nonzero urb status received: -EPIPE\n");
 			break;
 		default:
