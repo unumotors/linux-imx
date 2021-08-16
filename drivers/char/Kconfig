@@ -561,3 +561,19 @@ config RANDOM_TRUST_BOOTLOADER
 	booloader is trustworthy so it will be added to the kernel's entropy
 	pool. Otherwise, say N here so it will be regarded as device input that
 	only mixes the entropy pool.
+
+config FSL_OTP
+	tristate "Freescale On-Chip OTP Memory Support"
+	depends on HAS_IOMEM && OF
+	help
+	  If you say Y here, you will get support for a character device
+	  interface into the One Time Programmable memory pages that are
+	  stored on the some Freescale i.MX processors.  This will not get
+	  you access to the secure memory pages however.  You will need to
+	  write your own secure code and reader for that.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called fsl_otp.
+
+	  If unsure, it is safe to say Y.
+	  available on i.MX8 SoCs.
