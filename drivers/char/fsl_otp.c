@@ -659,9 +659,9 @@ static int fsl_otp_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	ocotp_np = of_find_compatible_node(NULL, NULL, "fsl,imx6ul-ocotp");
+	ocotp_np = of_parse_phandle(pdev->dev.of_node, "ocotp", 0);
 	if (!ocotp_np) {
-		dev_err(&pdev->dev, "failed to find fsl,imx6ul-ocotp node");
+		dev_err(&pdev->dev, "failed to find ocotp node\n");
 		return -ENOENT;
 	}
 
